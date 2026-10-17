@@ -1,0 +1,19 @@
+{
+  "name": "agent-trust-passport",
+  "version": "0.1.0",
+  "description": "Portable reputation layer for AI agents that spend money. PayBox marketplace plugin.",
+  "type": "module",
+  "packageManager": "pnpm@11.11.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "demo": "tsc -p tsconfig.json && node dist/demo.js",
+    "start": "node dist/server.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
