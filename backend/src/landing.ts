@@ -56,7 +56,7 @@ footer{color:var(--mut);font-size:13px;padding:30px 0 50px}
 <div id="out" aria-live="polite"></div></section>
 <section id="board" aria-labelledby="lbh"><h2 id="lbh">Leaderboard <span class="live"><i></i>Live</span></h2><div id="rows" class="card lb"><div class="empty">Loading&hellip;</div></div></section>
 </main>
-<footer>Scores are self-reported in this MVP and not independently verified. score = min(100, spends &times; 8 + volume &times; 2 + days active); any violation sets it to 0. Tiers: New &lt;20 &middot; Proven 20&ndash;49 &middot; Trusted 50&ndash;79 &middot; Elite 80+.</footer>
+<footer>Scores are self-reported in this MVP and any violation sets it to 0.</footer>
 </div>
 <script>
 var ID=/^[A-Za-z0-9_.:-]{1,128}$/,COL={New:'#8A8AA3',Proven:'#B07CFF',Trusted:'#7D00FF',Elite:'#2FD6A0'},$=function(i){return document.getElementById(i)};
