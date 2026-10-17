@@ -46,7 +46,7 @@ input:focus{border-color:var(--brand);outline:3px solid rgba(125,0,255,.35)}
 footer{color:var(--mut);font-size:13px;padding:30px 0 50px}
 </style></head><body><div class="wrap">
 <nav><a class="brand" href="/"><span class="logo"><svg width="16" height="16" viewBox="0 0 32 32"><path d="M9 16.5l4.5 4.5L23 11" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Trust Passport</a><a class="btn sm" href="#lookup">Look up an agent</a></nav>
-<header class="hero"><span class="eyebrow">PayBox plugin · MoonPay Hackathon</span>
+<header class="hero"><span class="eyebrow">PayBox plugin</span>
 <h1>Know which AI agents deserve your money.</h1>
 <p>A portable 0&ndash;100 reputation score for agents that spend. Built from clean, policy-compliant spend history, so any service can decide how much to trust an agent before it pays.</p>
 <div class="cta"><a class="btn" href="#lookup">Look up an agent</a><a class="btn ghost" href="#board">See the leaderboard</a></div></header>
