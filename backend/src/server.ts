@@ -6,6 +6,7 @@ import { createPlugin } from "./index.js";
 import { badgeSvg, cardSvg } from "./badge.js";
 import { landingHtml } from "./landing.js";
 import { DEMO_AGENTS } from "./demo-agents.js";
+import { Signer } from "./signing.js";
 import { ADDRESS_RE, TX_RE, VerifyError, httpRpc, verifyBaseUsdcPayment, type Rpc } from "./onchain.js";
 
 const GRANT_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -23,6 +24,8 @@ export interface ServerOptions {
   hideLeaderboard?: boolean;
   /** JSON-RPC client for Base, used to verify tx_hash payments. Defaults to BASE_RPC_URL. */
   rpc?: Rpc;
+  /** Signs passports. Defaults to a temporary in-memory key. */
+  signer?: Signer;
 }
 
 function send(res: http.ServerResponse, status: number, body: unknown) {
@@ -84,6 +87,7 @@ function readJson(req: http.IncomingMessage): Promise<unknown> {
 
 export function createServer(opts: ServerOptions = {}) {
   const store = opts.store ?? new PassportStore();
+  const signer = opts.signer ?? new Signer();
   const rpc = opts.rpc ?? httpRpc(process.env.BASE_RPC_URL ?? "https://mainnet.base.org");
   const { tools } = createPlugin(store);
   const getTool = tools.find((t) => t.name === "get_trust_passport")!;
@@ -121,6 +125,25 @@ export function createServer(opts: ServerOptions = {}) {
         return sendText(res, "image/svg+xml; charset=utf-8", parts[0] === "badge" ? badgeSvg(p) : cardSvg(p), {
           "cache-control": "public, max-age=300",
         });
+      }
+
+      // Public verification key for signed passports
+      if (req.method === "GET" && url.pathname === "/.well-known/passport-key") {
+        return send(res, 200, {
+          alg: "Ed25519",
+          kid: signer.kid,
+          publicKey: signer.publicKey,
+          publicKeyPem: signer.publicKeyPem,
+          ephemeral: signer.ephemeral,
+        });
+      }
+
+      // GET /passport/:grantId/signed?ttl_hours=24 (aggregate claims only)
+      if (req.method === "GET" && parts.length === 3 && parts[0] === "passport" && parts[2] === "signed") {
+        const grantId = decodeURIComponent(parts[1]);
+        if (!GRANT_RE.test(grantId)) return send(res, 400, { error: "invalid grant id" });
+        const ttl = Math.min(168, Math.max(1, Number(url.searchParams.get("ttl_hours")) || 24));
+        return send(res, 200, signer.sign(store.get(grantId), Date.now(), ttl));
       }
 
       // GET /passport/:grantId
@@ -161,7 +184,7 @@ export function createServer(opts: ServerOptions = {}) {
           try {
             const pay = await verifyBaseUsdcPayment(rpc, body.tx_hash, payer as string | undefined);
             const { payer_address: _p, ...rest } = body;
-            body = { ...rest, amount_usd: pay.amountUsd, tx_hash: pay.txHash };
+            body = { ...rest, amount_usd: pay.amountUsd, tx_hash: pay.txHash, payer: pay.payer };
           } catch (e) {
             if (e instanceof VerifyError) return send(res, e.status, { error: e.message });
             return send(res, 502, { error: "could not verify the transaction right now" });
@@ -190,7 +213,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const writeToken = process.env.PASSPORT_WRITE_TOKEN;
   const store = new PassportStore({ file: process.env.DATA_FILE });
   if (process.env.SEED_DEMO_DATA === "true" && store.seedIfEmpty(DEMO_AGENTS)) console.log("Seeded demo agents (SEED_DEMO_DATA=true).");
-  createServer({ writeToken, store, hideLeaderboard: process.env.PASSPORT_HIDE_LEADERBOARD === "1" }).listen(port, () => {
+  const signer = new Signer(process.env.PASSPORT_SIGNING_KEY);
+  if (signer.ephemeral) console.log("PASSPORT_SIGNING_KEY not set: using a temporary signing key that changes on restart.");
+  createServer({ writeToken, store, signer, hideLeaderboard: process.env.PASSPORT_HIDE_LEADERBOARD === "1" }).listen(port, () => {
     console.log(`Agent Trust Passport listening on :${port}`);
     if (!writeToken) console.log("PASSPORT_WRITE_TOKEN not set: writes are disabled.");
     if (!process.env.DATA_FILE) console.log("DATA_FILE not set: state is in-memory and lost on restart.");

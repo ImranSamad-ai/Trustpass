@@ -52,6 +52,8 @@ export interface TrustPassport {
   verifiedSpends: number;
   verifiedVolumeUsd: number;
   evidence: Evidence;
+  /** Wallet that made this agent's first verified payment; later verified payments must match. */
+  wallet: string | null;
   summary: string;
   generatedAt: string;
 }
@@ -67,6 +69,7 @@ interface GrantState {
   verifiedSpends: number;
   verifiedVolumeUsd: number;
   verifiedTxs: string[];
+  wallet: string | null;
 }
 
 const RECENT_LIMIT = 10;
@@ -103,6 +106,7 @@ function emptyState(): GrantState {
     verifiedSpends: 0,
     verifiedVolumeUsd: 0,
     verifiedTxs: [],
+    wallet: null,
   };
 }
 
@@ -121,6 +125,8 @@ export class PassportStore {
   private grants = new Map<string, GrantState>();
   /** tx hash -> grant that already counted it (replay protection). */
   private txIndex = new Map<string, string>();
+  /** wallet -> agent it is bound to (one wallet backs one agent). */
+  private walletIndex = new Map<string, string>();
   private now: () => number;
   private file?: string;
 
@@ -139,6 +145,7 @@ export class PassportStore {
         const g = { ...emptyState(), ...(st as Partial<GrantState>) };
         this.grants.set(id, g);
         for (const tx of g.verifiedTxs) this.txIndex.set(tx, id);
+        if (g.wallet) this.walletIndex.set(g.wallet, id);
       }
     }
   }
@@ -238,6 +245,7 @@ export class PassportStore {
       recentSpends: [...s.recentSpends],
       verifiedSpends: s.verifiedSpends,
       verifiedVolumeUsd: round2(s.verifiedVolumeUsd),
+      wallet: s.wallet,
       evidence:
         s.verifiedSpends === 0 ? "self_reported" : s.verifiedSpends >= s.successfulSpends ? "onchain_verified" : "mixed",
       summary: buildSummary({ tier, score, status, spends: s.successfulSpends, volume: s.cleanVolumeUsd, violations: s.violations.length }),
@@ -248,14 +256,27 @@ export class PassportStore {
   /** Record a clean, policy-compliant spend and return the updated passport. */
   recordSuccessfulSpend(
     grantId: string,
-    spend: { amountUsd: number; category?: string; policy?: PolicySummary; txHash?: string },
+    spend: { amountUsd: number; category?: string; policy?: PolicySummary; txHash?: string; payer?: string },
   ): TrustPassport {
     if (!Number.isFinite(spend.amountUsd) || spend.amountUsd <= 0) {
       throw new Error("amount_usd must be a positive number");
     }
     const tx = spend.txHash?.toLowerCase();
     if (tx && this.txIndex.has(tx)) throw new Error("this transaction has already been counted");
+    const payer = tx ? spend.payer?.toLowerCase() : undefined;
+    if (payer) {
+      const bound = this.grants.get(grantId)?.wallet;
+      if (bound && bound !== payer) {
+        throw new Error(`this agent is bound to wallet ${shortAddr(bound)}; this payment came from ${shortAddr(payer)}`);
+      }
+      const owner = this.walletIndex.get(payer);
+      if (owner && owner !== grantId) throw new Error(`wallet ${shortAddr(payer)} is already bound to another agent`);
+    }
     const s = this.state(grantId);
+    if (payer && !s.wallet) {
+      s.wallet = payer;
+      this.walletIndex.set(payer, grantId);
+    }
     const nowMs = this.now();
 
     if (tx) {
@@ -298,9 +319,14 @@ export class PassportStore {
   /** Revoking the underlying grant resets the passport. */
   reset(grantId: string): void {
     for (const tx of this.grants.get(grantId)?.verifiedTxs ?? []) this.txIndex.delete(tx);
+    for (const [w, id] of this.walletIndex) if (id === grantId) this.walletIndex.delete(w);
     this.grants.delete(grantId);
     this.persist();
   }
+}
+
+export function shortAddr(a: string): string {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
 
 function round2(n: number): number {

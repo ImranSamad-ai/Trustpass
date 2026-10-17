@@ -44,6 +44,7 @@ export function createPlugin(store: PassportStore = new PassportStore()) {
     allowed_categories?: string[];
     time_window?: string;
     tx_hash?: string;
+    payer?: string;
     grant_id?: string;
   }> = {
     name: "record_successful_spend",
@@ -57,6 +58,7 @@ export function createPlugin(store: PassportStore = new PassportStore()) {
         max_amount_usd: { type: "number", description: "Policy: max amount per spend." },
         allowed_categories: { type: "array", items: { type: "string" }, description: "Policy: allowed categories." },
         time_window: { type: "string", description: "Policy: time window, e.g. '24h'." },
+        payer: { type: "string", description: "Payer wallet read from the verified transaction, set by the server." },
         tx_hash: { type: "string", description: "Base transaction hash, already verified on-chain by the server." },
         grant_id: { type: "string" },
       },
@@ -72,6 +74,7 @@ export function createPlugin(store: PassportStore = new PassportStore()) {
         amountUsd: input.amount_usd,
         category: input.category,
         txHash: input.tx_hash,
+        payer: input.payer,
         policy: Object.keys(policy).length ? policy : undefined,
       });
     },

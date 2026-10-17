@@ -93,3 +93,51 @@ describe("POST spend with tx_hash", () => {
     expect((await post("agent-v", {})).status).toBe(400);
   });
 });
+
+describe("wallet binding", () => {
+  const WALLET_B = `0x${"d".repeat(40)}`;
+  const rpc2 = fakeRpc({
+    [hash(10)]: receipt([usdc(PAYER, 3_000_000n)]),
+    [hash(11)]: receipt([usdc(PAYER, 2_000_000n)]),
+    [hash(12)]: receipt([usdc(WALLET_B, 4_000_000n)], { from: WALLET_B }),
+    [hash(13)]: receipt([usdc(PAYER, 1_000_000n)]),
+  });
+  const srv = createServer({ writeToken: "t", rpc: rpc2 });
+  let u = "";
+  beforeAll(async () => {
+    u = await new Promise<string>((r) => srv.listen(0, () => r(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)));
+  });
+  afterAll(() => srv.close());
+  const rec = (id: string, body: unknown) =>
+    fetch(`${u}/passport/${id}/spend`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer t" },
+      body: JSON.stringify(body),
+    });
+  const err = async (r: Response) => ((await r.json()) as any).error as string;
+
+  it("binds the first verified payer and accepts more payments from it", async () => {
+    const first: any = await (await rec("bound-1", { tx_hash: hash(10) })).json();
+    expect(first.wallet).toBe(PAYER);
+    const second = await rec("bound-1", { tx_hash: hash(11) });
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as any).verifiedSpends).toBe(2);
+  });
+
+  it("rejects another wallet for a bound agent, and one wallet for two agents", async () => {
+    const other = await rec("bound-1", { tx_hash: hash(12) });
+    expect(other.status).toBe(400);
+    expect(await err(other)).toMatch(/bound to wallet/);
+    const dup = await rec("bound-2", { tx_hash: hash(13) });
+    expect(dup.status).toBe(400);
+    expect(await err(dup)).toMatch(/already bound to another agent/);
+  });
+
+  it("leaves no empty agent behind after a rejection, and self-reported spends stay unbound", async () => {
+    const lb: any = await (await fetch(`${u}/leaderboard`)).json();
+    expect(lb.agents.map((a: any) => a.agentId)).toEqual(["bound-1"]);
+    const sr: any = await (await rec("self-1", { amount_usd: 4 })).json();
+    expect(sr.wallet).toBeNull();
+    expect(sr.evidence).toBe("self_reported");
+  });
+});

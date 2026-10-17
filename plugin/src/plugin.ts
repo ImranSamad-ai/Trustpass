@@ -1,13 +1,21 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { x402OutputSchema } from "./paybox.js";
 import {
   calculateInput,
   calculateOutput,
   checkInput,
   checkOutput,
   checkSpendAllowed,
+  paymentInput,
+  proposeTrustedPayment,
   calculateTrustScore,
   getInput,
+  getSignedPassport,
+  signedOutput,
+  verifyInput,
+  verifyOutput,
+  verifySignedPassport,
   getTrustPassport,
   passportOutput,
   recordInput,
@@ -18,7 +26,7 @@ const PROTOCOL_VERSION = "2026-07-28";
 
 function createServer() {
   const server = new McpServer(
-    { name: "agent-trust-passport", version: "0.2.0" },
+    { name: "agent-trust-passport", version: "0.4.0" },
     { supportedProtocolVersions: [PROTOCOL_VERSION] },
   );
 
@@ -59,6 +67,45 @@ function createServer() {
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => checkSpendAllowed(input),
+  );
+
+  server.registerTool(
+    "propose_trusted_payment",
+    {
+      title: "Propose trusted payment",
+      description:
+        "Proposes a Base USDC x402 payment to a paid HTTPS endpoint, but only if the payee's Trust Passport meets a minimum tier (default Trusted), has no violations, and optionally has on-chain verified spends. If the payee fails the check, no proposal is returned. Nothing is signed or paid here: PayBox shows the proposal for user approval. max_amount_usdc is in USDC (e.g. \"0.05\"), not atomic units.",
+      inputSchema: paymentInput,
+      outputSchema: x402OutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => proposeTrustedPayment(input),
+  );
+
+  server.registerTool(
+    "get_signed_passport",
+    {
+      title: "Get signed passport",
+      description:
+        "Returns a Trust Passport signed with the issuer's Ed25519 key (valid for 24 hours). The signed passport is portable: anyone holding the issuer's public key can verify it offline with verify_signed_passport, without calling the passport service.",
+      inputSchema: getInput,
+      outputSchema: signedOutput,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => getSignedPassport(input),
+  );
+
+  server.registerTool(
+    "verify_signed_passport",
+    {
+      title: "Verify signed passport",
+      description:
+        "Offline check of a signed Trust Passport: Ed25519 signature, expiry, and optionally a minimum tier. Needs the issuer's public key (pin it from a trusted source). A valid signature proves the issuer said this at issuance time, not that it is still current; short expiries limit staleness.",
+      inputSchema: verifyInput,
+      outputSchema: verifyOutput,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input) => verifySignedPassport(input),
   );
 
   server.registerTool(

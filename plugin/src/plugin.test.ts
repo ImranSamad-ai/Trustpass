@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { generateKeyPairSync, sign } from "node:crypto";
+import { canonicalize } from "./signing.js";
 import { baseUrl, type Deps } from "./api.js";
 import {
   calculateTrustScore,
   checkSpendAllowed,
+  proposeTrustedPayment,
+  getSignedPassport,
+  verifySignedPassport,
   getTrustPassport,
   passportOutput,
   recordSuccessfulSpend,
@@ -185,4 +190,97 @@ test("check_spend_allowed denies low tier, violations, and policy breaches", asy
   const c = await checkSpendAllowed({ agent_id: "a", amount_usd: 1, min_tier: "Proven", category: "gambling" }, cat.deps);
   assert.equal(c.structuredContent?.decision, "deny");
   assert.match(String((c.structuredContent?.reasons as string[])[0]), /not among/);
+});
+
+const PAY = { payee_id: "svc-1", endpoint: "https://api.example.com/paid", max_amount_usdc: "0.05", min_tier: "Trusted", require_onchain_evidence: false } as const;
+
+test("propose_trusted_payment returns an x402 proposal for a trusted payee", async () => {
+  const { deps } = mock(() => json({ ...backendBody, violations: [] }));
+  const r = await proposeTrustedPayment(PAY, deps);
+  assert.equal(r.isError, undefined);
+  const p = (r.structuredContent as any)["io.paybox/transactionProposal"];
+  assert.equal(p.kind, "x402");
+  assert.equal(p.chain, "eip155:8453");
+  assert.equal(p.payment.maxAmount, "50000");
+  assert.equal(p.payment.asset, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+  assert.equal(p.request.url, "https://api.example.com/paid");
+  assert.match(r.content[0]!.text, /passed the trust check/);
+});
+
+test("propose_trusted_payment refuses untrusted, violating or unverified payees", async () => {
+  const low = mock(() => json({ ...backendBody, score: 18, tier: "New", violations: [] }));
+  const a = await proposeTrustedPayment(PAY, low.deps);
+  assert.equal(a.isError, true);
+  assert.equal(a.structuredContent, undefined, "no proposal when denied");
+  assert.match(a.content[0]!.text, /below the required Trusted/);
+
+  const viol = mock(() => json(backendBody)); // has 1 violation
+  assert.match((await proposeTrustedPayment(PAY, viol.deps)).content[0]!.text, /violation/);
+
+  const unverified = mock(() => json({ ...backendBody, violations: [] }));
+  const u = await proposeTrustedPayment({ ...PAY, require_onchain_evidence: true }, unverified.deps);
+  assert.equal(u.isError, true);
+  assert.match(u.content[0]!.text, /on-chain verified/);
+});
+
+test("propose_trusted_payment rejects unsafe endpoints and zero amounts", async () => {
+  const { deps } = mock(() => json({ ...backendBody, violations: [] }));
+  for (const bad of [{ endpoint: "http://api.example.com/x" }, { endpoint: "https://api.example.com:8443/x" }, { max_amount_usdc: "0" }]) {
+    const r = await proposeTrustedPayment({ ...PAY, ...bad }, deps);
+    assert.equal(r.isError, true, JSON.stringify(bad));
+    assert.equal(r.structuredContent, undefined);
+  }
+});
+
+function makeSigned(overrides: Record<string, unknown> = {}, nowMs = Date.now()) {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const passport = {
+    v: 1 as const, agentId: "agent-1", score: 58, tier: "Trusted" as const, status: "active" as const,
+    successfulSpends: 3, cleanVolumeUsd: 17, verifiedSpends: 0, evidence: "self_reported" as const,
+    issuedAt: new Date(nowMs - 1000).toISOString(), expiresAt: new Date(nowMs + 3_600_000).toISOString(), ...overrides,
+  };
+  const signature = sign(null, Buffer.from(canonicalize(passport)), privateKey).toString("base64url");
+  const pub = (publicKey.export({ format: "der", type: "spki" }) as Buffer).subarray(-32).toString("base64url");
+  return { passport, signature, public_key: pub };
+}
+
+test("verify_signed_passport accepts a good signature, offline", async () => {
+  const doc = makeSigned();
+  const r = await verifySignedPassport({ ...doc, min_tier: "Trusted" });
+  assert.equal(r.isError, undefined);
+  assert.equal(r.structuredContent?.valid, true);
+  assert.equal(r.structuredContent?.meetsMinTier, true);
+  assert.match(r.content[0]!.text, /^VALID/);
+});
+
+test("verify_signed_passport rejects tampering, wrong key, expiry and low tier", async () => {
+  const doc = makeSigned();
+  const tampered = await verifySignedPassport({ ...doc, passport: { ...doc.passport, score: 100 } });
+  assert.equal(tampered.structuredContent?.signatureValid, false);
+  assert.equal(tampered.structuredContent?.valid, false);
+
+  const wrongKey = await verifySignedPassport({ ...doc, public_key: makeSigned().public_key });
+  assert.equal(wrongKey.structuredContent?.valid, false);
+
+  const old = makeSigned({}, Date.now() - 7_200_000); // expired an hour ago
+  const exp = await verifySignedPassport(old);
+  assert.equal(exp.structuredContent?.signatureValid, true);
+  assert.equal(exp.structuredContent?.expired, true);
+  assert.equal(exp.structuredContent?.valid, false);
+
+  const low = await verifySignedPassport({ ...doc, min_tier: "Elite" });
+  assert.equal(low.structuredContent?.valid, false);
+  assert.equal(low.structuredContent?.meetsMinTier, false);
+});
+
+test("get_signed_passport reads /signed and strips unknown fields", async () => {
+  const doc = makeSigned();
+  const { deps, calls } = mock(() => json({ passport: doc.passport, signature: doc.signature, alg: "Ed25519", kid: "abc", extra: "x" }, 200));
+  const bad = await getSignedPassport({ agent_id: "agent-1" }, deps);
+  assert.equal(bad.isError, true, "strict output schema rejects unexpected shapes");
+  const ok = mock(() => json({ passport: doc.passport, signature: doc.signature, alg: "Ed25519", kid: "abc" }));
+  const r = await getSignedPassport({ agent_id: "agent-1" }, ok.deps);
+  assert.equal(r.isError, undefined);
+  assert.equal(ok.calls[0]!.url, `${BASE}/passport/agent-1/signed`);
+  assert.ok(calls.length === 1);
 });

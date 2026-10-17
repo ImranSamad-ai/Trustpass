@@ -1,5 +1,7 @@
 import * as z from "zod/v4";
 import { AGENT_ID_PATTERN, ApiError, callApi, defaultDeps, type Deps } from "./api.js";
+import { atomicAmount, proposeX402 } from "./paybox.js";
+import { signatureMatches } from "./signing.js";
 import { FORMULA, TIER_MIN_SCORE, TIER_ORDER, computeScore, tierForScore } from "./score.js";
 
 const tier = z.enum(["New", "Proven", "Trusted", "Elite"]);
@@ -37,6 +39,73 @@ export const checkInput = z
     amount_usd: z.number().positive().max(1_000_000_000).describe("USD amount the agent wants to spend."),
     min_tier: z.enum(["Proven", "Trusted", "Elite"]).default("Trusted").describe("Minimum tier required to allow the spend."),
     category: z.string().min(1).max(64).optional().describe("Spend category, checked against the agent's declared categories."),
+  })
+  .strict();
+
+export const paymentInput = z
+  .object({
+    payee_id: agentId.describe("Trust Passport ID of the agent or service being paid."),
+    endpoint: z.url().max(2048).describe("HTTPS URL of the paid x402 endpoint (GET, port 443). Its host must be in the plugin's network list."),
+    max_amount_usdc: z
+      .string()
+      .regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/)
+      .describe("Maximum payment in USDC as a decimal string, e.g. \"0.05\" (not atomic units)."),
+    min_tier: z.enum(["Proven", "Trusted", "Elite"]).default("Trusted").describe("Minimum payee tier required before a payment is proposed."),
+    require_onchain_evidence: z.boolean().default(false).describe("If true, the payee must have at least one on-chain verified spend."),
+  })
+  .strict();
+
+const claims = z
+  .object({
+    v: z.literal(1),
+    agentId: z.string().regex(AGENT_ID_PATTERN),
+    score: z.number().int().min(0).max(100),
+    tier,
+    status: z.enum(["new", "active", "violated"]),
+    successfulSpends: z.number().int().min(0),
+    cleanVolumeUsd: z.number().min(0),
+    verifiedSpends: z.number().int().min(0),
+    evidence,
+    issuedAt: z.string().max(40),
+    expiresAt: z.string().max(40),
+  })
+  .strict();
+
+export const signedOutput = z
+  .object({
+    passport: claims,
+    signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
+    alg: z.literal("Ed25519"),
+    kid: z.string().max(64),
+  })
+  .strict();
+
+export const verifyInput = z
+  .object({
+    passport: claims.describe("The signed claims, exactly as returned by get_signed_passport."),
+    signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/).describe("base64url Ed25519 signature."),
+    public_key: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{43}$/)
+      .describe("The issuer's raw 32-byte public key, base64url. Pin it from a source you trust, not from the passport holder."),
+    min_tier: z.enum(["Proven", "Trusted", "Elite"]).optional().describe("Optionally require at least this tier."),
+  })
+  .strict();
+
+export const verifyOutput = z
+  .object({
+    valid: z.boolean(),
+    signatureValid: z.boolean(),
+    expired: z.boolean(),
+    meetsMinTier: z.boolean().nullable(),
+    agentId: z.string(),
+    score: z.number().int(),
+    tier,
+    status: z.enum(["new", "active", "violated"]),
+    evidence,
+    issuedAt: z.string(),
+    expiresAt: z.string(),
+    reasons: z.array(z.string()).max(6),
   })
   .strict();
 
@@ -253,4 +322,81 @@ export async function calculateTrustScore(input: z.infer<typeof calculateInput>)
   });
   const t = tierForScore(score);
   return ok(`Score ${score}/100 (${t}).`, calculateOutput.parse({ score, tier: t, formula: FORMULA }));
+}
+
+/**
+ * Trust-gated x402 payment: proposes a Base USDC payment only if the payee's
+ * Trust Passport clears the bar. Nothing is signed or paid here; PayBox shows
+ * the proposal to the user for approval.
+ */
+export function proposeTrustedPayment(input: z.infer<typeof paymentInput>, deps: Deps = defaultDeps()): Promise<ToolResult> {
+  return guard(async () => {
+    const p = toPassport(await callApi("GET", `/passport/${encodeURIComponent(input.payee_id)}`, undefined, deps));
+    const need = input.min_tier;
+    const deny: string[] = [];
+    if (p.violationCount > 0) deny.push(`${p.violationCount} policy violation(s) are recorded for the payee.`);
+    if (TIER_ORDER.indexOf(p.tier) < TIER_ORDER.indexOf(need)) {
+      deny.push(`Payee score ${p.score} (${p.tier}) is below the required ${need} tier (${TIER_MIN_SCORE[need]}+).`);
+    }
+    if (input.require_onchain_evidence && p.verifiedSpends === 0) {
+      deny.push("Payee has no on-chain verified spends, which this payment requires.");
+    }
+    if (deny.length > 0) return fail(`Payment not proposed. ${deny.join(" ")}`);
+
+    let atomic: string;
+    try {
+      atomic = atomicAmount(input.max_amount_usdc, 6);
+      if (atomic === "0") throw new Error("max_amount_usdc must be greater than zero.");
+      const proposal = proposeX402({ chain: "eip155:8453", url: input.endpoint, maxAmount: atomic });
+      const text = `Payee ${p.agentId} passed the trust check (score ${p.score}, ${p.tier}, evidence: ${p.evidence}). ${proposal.content[0]!.text}`;
+      return { ...proposal, content: [{ type: "text", text }] };
+    } catch (error) {
+      return fail(error instanceof Error ? error.message.slice(0, 200) : "Could not build the payment proposal.");
+    }
+  });
+}
+
+/** Fetches a passport signed by the passport service. */
+export function getSignedPassport(input: z.infer<typeof getInput>, deps: Deps = defaultDeps()): Promise<ToolResult> {
+  return guard(async () => {
+    const raw = await callApi("GET", `/passport/${encodeURIComponent(input.agent_id)}/signed`, undefined, deps);
+    const doc = signedOutput.parse(raw);
+    return ok(
+      `Signed passport for ${doc.passport.agentId}: ${doc.passport.tier}, score ${doc.passport.score}/100, valid until ${doc.passport.expiresAt}. Verify it offline with verify_signed_passport and the issuer's public key.`,
+      doc,
+    );
+  });
+}
+
+/** Offline: checks signature, expiry and (optionally) tier. No backend call. */
+export async function verifySignedPassport(input: z.infer<typeof verifyInput>, now = Date.now()): Promise<ToolResult> {
+  const c = input.passport;
+  const signatureValid = signatureMatches(c, input.signature, input.public_key);
+  const expiresMs = Date.parse(c.expiresAt);
+  const issuedMs = Date.parse(c.issuedAt);
+  const expired = !(now <= expiresMs);
+  const fromFuture = !(issuedMs <= now + 5 * 60_000);
+  const meetsMinTier = input.min_tier ? TIER_ORDER.indexOf(c.tier) >= TIER_ORDER.indexOf(input.min_tier) : null;
+  const reasons: string[] = [];
+  if (!signatureValid) reasons.push("Signature does not match this passport and public key.");
+  if (signatureValid && expired) reasons.push(`Passport expired at ${c.expiresAt}; fetch a fresh one.`);
+  if (signatureValid && fromFuture) reasons.push("Passport claims to be issued in the future.");
+  if (meetsMinTier === false) reasons.push(`Tier ${c.tier} is below the required ${input.min_tier}.`);
+  const valid = signatureValid && !expired && !fromFuture && meetsMinTier !== false;
+  if (valid) reasons.push("Signature verified and passport is within its validity window.");
+  const out = verifyOutput.parse({
+    valid,
+    signatureValid,
+    expired,
+    meetsMinTier,
+    agentId: c.agentId,
+    score: c.score,
+    tier: c.tier,
+    status: c.status,
+    evidence: c.evidence,
+    issuedAt: c.issuedAt,
+    expiresAt: c.expiresAt,
+    reasons: reasons.slice(0, 6),
+  });
+  return ok(`${valid ? "VALID" : "INVALID"}: ${reasons.join(" ")}`, out);
 }

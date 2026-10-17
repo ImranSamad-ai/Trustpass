@@ -32,6 +32,9 @@ PayBox plugins run in a fresh sandbox on every call and keep no state, so the pl
 | `get_trust_passport` | Returns an agent's passport: score, tier, status, clean volume, successful spends, policy summary. A brand-new agent returns score 0. | `agent_id` |
 | `record_successful_spend` | Records one clean, policy-compliant spend and returns the updated passport. With `tx_hash` the backend verifies the payment on Base and reads the amount from the chain. | `agent_id`, then `tx_hash` (verified) or `amount_usd` (self-reported); optional `payer_address`, `category`, `max_amount_usd`, `allowed_categories`, `time_window` |
 | `check_spend_allowed` | Advisory allow/deny before an agent spends: checks tier, violations, the agent's declared per-spend limit and categories. Returns reasons. | `agent_id`, `amount_usd`, optional `min_tier` (default `Trusted`), `category` |
+| `propose_trusted_payment` | Proposes a Base USDC [x402](https://developer.paybox.sh/requirements.md) payment to a paid endpoint, but only if the payee's passport clears a minimum tier, has no violations, and optionally has on-chain verified spends. Otherwise no proposal is returned. | `payee_id`, `endpoint`, `max_amount_usdc` (e.g. `"0.05"`), optional `min_tier` (default `Trusted`), `require_onchain_evidence` |
+| `get_signed_passport` | Returns the passport signed with the issuer's Ed25519 key, valid for 24 hours, so it can be carried to other services. | `agent_id` |
+| `verify_signed_passport` | Offline check of a signed passport: signature, expiry and optional minimum tier. No backend call. | `passport`, `signature`, `public_key`, optional `min_tier` |
 | `calculate_trust_score` | Computes a score and tier from counts. Offline, no backend call. Useful for deciding what minimum score to require. | `successful_spends`, `clean_volume_usd`, `days_active`, optional `violations` |
 
 `agent_id` must match `^[A-Za-z0-9_.:-]{1,128}$`.
@@ -63,6 +66,14 @@ Ask whether an agent may spend $20 (needs at least Trusted):
 { "agent_id": "test-agent", "amount_usd": 20, "min_tier": "Trusted" }
 ```
 
+Propose a trust-gated payment of up to 0.05 USDC:
+
+```json
+{ "payee_id": "weather-agent", "endpoint": "https://api.example.com/paid", "max_amount_usdc": "0.05", "min_tier": "Trusted" }
+```
+
+If the payee's passport is below Trusted, the tool refuses and returns no payment proposal. If it passes, PayBox receives an unsigned x402 proposal and the user approves it.
+
 Work out what a passport needs offline:
 
 ```json
@@ -85,15 +96,32 @@ any recorded violation sets the score to 0
 | 50-79 | Trusted |
 | 80-100 | Elite |
 
+## Trust-gated payments
+
+`propose_trusted_payment` puts the score at the moment money moves. It looks up the payee's passport, applies the gate, and only then builds an unsigned x402 proposal (USDC on Base, GET, HTTPS port 443). The plugin never signs or pays: PayBox shows the proposal to the user, who approves it, and PayBox completes the payment.
+
+Limits to be aware of: the gate applies only to payments proposed through this tool, and a passport describes how an agent *spends*, so it fits marketplaces where agents both buy and sell. The paid endpoint's hostname must be added to the plugin's network list in the PayBox portal.
+
+## Signed passports
+
+`get_signed_passport` returns the passport claims plus an Ed25519 signature. Any service holding the issuer's public key can verify it offline with `verify_signed_passport`, with no call to the passport service. A tampered score fails verification.
+
+- **Signed claims:** `v`, `agentId`, `score`, `tier`, `status`, `successfulSpends`, `cleanVolumeUsd`, `verifiedSpends`, `evidence`, `issuedAt`, `expiresAt`.
+- **Canonical form for other languages:** the claims object with keys sorted alphabetically, serialized as compact JSON (no whitespace) in UTF-8. The signature is Ed25519 over those bytes, base64url encoded. The public key is the raw 32 bytes, base64url, from `/.well-known/passport-key`.
+- **Key setup:** run `node keygen.mjs` in `backend/`, then set the output as `PASSPORT_SIGNING_KEY` on your host. Keep it secret and out of git.
+
+Limits to be aware of: a valid signature proves what the issuer said at issuance, not that it is still true, so a violation recorded afterwards is not reflected until the passport expires (24 hours by default). Pin the public key from a source you trust, not from the party presenting the passport. Anyone with the private key can forge passports.
+
 ## On-chain verification
 
 When `record_successful_spend` receives a `tx_hash`, the backend checks the transaction on Base through a public JSON-RPC endpoint before counting it:
 
 - the transaction is mined, succeeded, and has at least 2 confirmations;
 - the amount is the sum of USDC `Transfer` logs sent by the payer (the transaction sender, or `payer_address` for facilitator-submitted payments such as x402), rounded down to whole cents;
-- each transaction hash counts once across all agents (replay protection).
+- each transaction hash counts once across all agents (replay protection);
+- wallet binding: the payer of an agent's first verified payment becomes its bound wallet. Later verified payments must come from the same wallet, and one wallet can back only one agent. The bound wallet shows on the landing page and the passport card.
 
-Limits to be aware of: this proves a payment happened, not that the caller is entitled to claim it, so one agent can still claim another wallet's public payment. Only USDC on Base is supported. Spends without `tx_hash` stay self-reported.
+Limits to be aware of: binding is first-claim-wins and does not prove the claimant controls the wallet, so someone could still bind their agent to a stranger's public payment. Proving control needs a wallet signature (see the roadmap). Only USDC on Base is supported. Spends without `tx_hash` stay self-reported.
 
 ## Repository layout
 
@@ -125,6 +153,8 @@ pnpm test          # type-check + deterministic build + PayBox conformance
 | GET | `/leaderboard?limit=10` | Top agents by score (aggregate fields only, max 25) |
 | GET | `/badge/:agentId.svg` | Compact badge for READMEs: `![Trust Passport](https://host/badge/agent-id.svg)` |
 | GET | `/card/:agentId.svg` | Shareable 600x315 passport card |
+| GET | `/passport/:agentId/signed?ttl_hours=24` | Signed passport (Ed25519). `ttl_hours` 1 to 168. |
+| GET | `/.well-known/passport-key` | Issuer public key (`kid`, raw `publicKey` base64url, PEM, and an `ephemeral` flag). |
 | GET | `/passport/:agentId` | Public aggregate view. Individual spends are only shown with the write token. |
 | POST | `/passport/:agentId/spend` | Requires `Authorization: Bearer <PASSPORT_WRITE_TOKEN>`. Body: `tx_hash` (verified) or `amount_usd` (self-reported), plus optional policy fields. |
 
@@ -137,6 +167,7 @@ pnpm test          # type-check + deterministic build + PayBox conformance
 | `PORT` | Listen port (default `8787`). |
 | `BASE_RPC_URL` | Base JSON-RPC endpoint used to verify `tx_hash` (default `https://mainnet.base.org`). |
 | `SEED_DEMO_DATA` | Set to `true` to seed four labeled `demo-` agents (one per tier) when the store is empty at startup. |
+| `PASSPORT_SIGNING_KEY` | Base64 PKCS8 Ed25519 private key for signed passports. Generate with `node keygen.mjs`. If unset, a temporary key is used and signatures stop verifying after a restart. |
 | `PASSPORT_HIDE_LEADERBOARD` | Set to `1` to hide the public leaderboard. |
 
 ### Run locally
@@ -180,7 +211,7 @@ docker run -p 8787:8787 -e PASSPORT_WRITE_TOKEN=change-me -v passport-data:/data
 
 ## Roadmap
 
-- Bind each agent to a wallet so only its own payments can be claimed
+- Require a wallet signature to prove control when binding an agent to a wallet
 - More chains and tokens for on-chain verification
 - Violation reporting with reasons and appeal flow
 - Per-service policy templates ("require Trusted or better for spends over $X")
